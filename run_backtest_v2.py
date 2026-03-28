@@ -1,6 +1,6 @@
 """
-Panther Backtest Runner — v2
-============================
+Panther Backtest Runner — v2.1
+================================
 Runs v2 strategy improvements side-by-side with v1 baselines for comparison.
 
 Usage:
@@ -10,11 +10,20 @@ Usage:
     python run_backtest_v2.py --equity 500       # $500 starting equity
     python run_backtest_v2.py --no-download      # Use cached data
 
-Changes vs v1 runner:
-  - Uses bot1_strategies_v2 (Candle3 + MeanReversion + TrendBreakout improved)
-  - Uses bot2_strategy_v2 (VolumeGen wider spread, tighter stop, ATR pause)
-  - Adds DualMeanReversionBacktest (15m + 5m confluence sizing)
-  - Side-by-side diff: v1 vs v2 for each strategy
+v2.1 fixes vs v2.0 runner:
+  - IMPORT PATHS: strategies are in strategies/ subdirectory.
+    v2.0 had bare imports ('from bot1_strategies_v2 import ...') which
+    would fail with ModuleNotFoundError at runtime.
+    Fixed: 'from strategies.bot1_strategies_v2 import ...'
+  - 15m CANDLE DATA: v2.0 had no 15m interval in the data fetcher dict.
+    The 15m MeanReversionBacktest was silently running on 5m candles
+    (passed as proxy). Fixed: added '15m' to intervals dict and now passes
+    correct candles_15m to the strategy.
+  - DualMeanReversionBacktest: defined in bot1_strategies_v2 but NEVER CALLED
+    in v2.0 runner. The runner instantiated 15m and 5m separately, so dual-signal
+    confluence sizing (2x on overlap) never activated.
+    Fixed: DualMeanReversionBacktest is now instantiated and run alongside
+    the individual timeframe results.
 """
 import argparse
 import json
@@ -22,66 +31,84 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# v2.1 FIX: Import from strategies package (strategies/ subdirectory)
+# v2.0 had bare imports that failed with ModuleNotFoundError
 from data_fetcher import fetch_full_history, save_candles, load_candles
 from engine import BacktestEngine, BacktestResult
 # v1 (baseline)
-from bot1_strategies import TrendBreakoutBacktest as TrendBreakoutV1
-from bot1_strategies import MeanReversionBacktest as MeanReversionV1
-from bot1_strategies import Candle3Backtest as Candle3V1
-from bot2_strategy import VolumeGenBacktest as VolumeGenV1
-# v2 (improved)
-from bot1_strategies_v2 import TrendBreakoutBacktest as TrendBreakoutV2
-from bot1_strategies_v2 import MeanReversionBacktest as MeanReversionV2
-from bot1_strategies_v2 import DualMeanReversionBacktest
-from bot1_strategies_v2 import Candle3Backtest as Candle3V2
-from bot2_strategy_v2 import VolumeGenBacktest as VolumeGenV2
+from strategies.bot1_strategies import TrendBreakoutBacktest as TrendBreakoutV1
+from strategies.bot1_strategies import MeanReversionBacktest as MeanReversionV1
+from strategies.bot1_strategies import Candle3Backtest as Candle3V1
+from strategies.bot2_strategy import VolumeGenBacktest as VolumeGenV1
+# v2.1 (improved + bug-fixed)
+from strategies.bot1_strategies_v2 import TrendBreakoutBacktest as TrendBreakoutV2
+from strategies.bot1_strategies_v2 import MeanReversionBacktest as MeanReversionV2
+from strategies.bot1_strategies_v2 import DualMeanReversionBacktest
+from strategies.bot1_strategies_v2 import Candle3Backtest as Candle3V2
+from strategies.bot2_strategy_v2 import VolumeGenBacktest as VolumeGenV2
 
 
-def run_bot1_v2(candles_1h, candles_5m, candles_3m, equity: float) -> dict:
-    """Run all three Bot1 v2 strategies."""
-    print("\\n" + "="*60)
-    print("BOT 1: PANTHER TRADING BOT v2 (Multi-Strategy Improved)")
+def run_bot1_v2(candles_1h, candles_5m, candles_15m, candles_3m, equity: float) -> dict:
+    """
+    Run all Bot1 v2.1 strategies.
+    v2.1 fix: accepts candles_15m separately — v2.0 was using 5m as a proxy for 15m.
+    """
+    print("\n" + "="*60)
+    print("BOT 1: PANTHER TRADING BOT v2.1 (Multi-Strategy + Bug Fixes)")
     print("="*60)
 
     engine = BacktestEngine(starting_equity=equity)
     results = {}
 
-    # Strategy 1: Trend Breakout v2 (10-bar lookback + fallback)
-    print("\\n  Running Trend Breakout v2 (1h) [10-bar lookback + fallback]...")
+    # Strategy 1: Trend Breakout v2.1 (10-bar lookback + fallback, bars_since_signal fix)
+    print("\n  Running Trend Breakout v2.1 (1h) [bars_since_signal fix]...")
     trend = TrendBreakoutV2(equity=equity)
     trend_trades = trend.run(candles_1h)
     results["trend_breakout_v2"] = engine.compute_stats(
-        trend_trades, "Trend Breakout v2 (1h)", "BTCUSDT", "1h",
+        trend_trades, "Trend Breakout v2.1 (1h)", "BTCUSDT", "1h",
         f"{candles_1h[0]['datetime'][:10]} to {candles_1h[-1]['datetime'][:10]}"
     )
     print(f"    {len(trend_trades)} trades | PnL: ${results['trend_breakout_v2'].total_pnl:.2f}")
 
-    # Strategy 2a: Mean Reversion v2 — 15m with band-close confirmation
-    print("\\n  Running Mean Reversion v2 (15m) [band-close confirm + reward 3.0]...")
+    # Strategy 2a: Mean Reversion v2.1 — 15m (correct 15m candles, cooldown fix)
+    print("\n  Running Mean Reversion v2.1 (15m) [correct candles, cooldown fix]...")
     scalp_15m = MeanReversionV2(equity=equity, is_5m=False)
-    scalp_15m_trades = scalp_15m.run(candles_5m)  # uses 5m candles as proxy for 15m
+    # v2.1 FIX: pass candles_15m (v2.0 was passing candles_5m as a "proxy" — wrong)
+    scalp_15m_trades = scalp_15m.run(candles_15m)
     results["mean_reversion_15m_v2"] = engine.compute_stats(
-        scalp_15m_trades, "Mean Reversion v2 (15m)", "BTCUSDT", "15m",
-        f"{candles_5m[0]['datetime'][:10]} to {candles_5m[-1]['datetime'][:10]}"
+        scalp_15m_trades, "Mean Reversion v2.1 (15m)", "BTCUSDT", "15m",
+        f"{candles_15m[0]['datetime'][:10]} to {candles_15m[-1]['datetime'][:10]}"
     )
     print(f"    {len(scalp_15m_trades)} trades | PnL: ${results['mean_reversion_15m_v2'].total_pnl:.2f}")
 
-    # Strategy 2b: Mean Reversion v2 — 5m secondary timeframe
-    print("\\n  Running Mean Reversion v2 (5m) [secondary timeframe, looser RSI]...")
+    # Strategy 2b: Mean Reversion v2.1 — 5m secondary timeframe
+    print("\n  Running Mean Reversion v2.1 (5m) [secondary timeframe, looser RSI]...")
     scalp_5m = MeanReversionV2(equity=equity, is_5m=True)
     scalp_5m_trades = scalp_5m.run(candles_5m)
     results["mean_reversion_5m_v2"] = engine.compute_stats(
-        scalp_5m_trades, "Mean Reversion v2 (5m)", "BTCUSDT", "5m",
+        scalp_5m_trades, "Mean Reversion v2.1 (5m)", "BTCUSDT", "5m",
         f"{candles_5m[0]['datetime'][:10]} to {candles_5m[-1]['datetime'][:10]}"
     )
     print(f"    {len(scalp_5m_trades)} trades | PnL: ${results['mean_reversion_5m_v2'].total_pnl:.2f}")
 
-    # Strategy 3: Candle3 v2 (volume confirmation + min hold)
-    print("\\n  Running Candle3 v2 (3m) [escalating volume + 1.5x avg + 3-bar min hold]...")
+    # Strategy 2c: Dual Mean Reversion (15m + 5m confluence sizing)
+    # v2.1 FIX: DualMeanReversionBacktest was never called in v2.0 runner.
+    # Dual-signal 2x sizing only activates when BOTH 15m AND 5m signal together.
+    print("\n  Running Dual Mean Reversion (15m + 5m confluence, 2x sizing on overlap)...")
+    dual_mr = DualMeanReversionBacktest(equity=equity)
+    dual_trades = dual_mr.run(candles_15m, candles_5m)
+    results["mean_reversion_dual_v2"] = engine.compute_stats(
+        dual_trades, "Dual Mean Reversion v2.1 (15m+5m)", "BTCUSDT", "multi",
+        f"{candles_5m[0]['datetime'][:10]} to {candles_5m[-1]['datetime'][:10]}"
+    )
+    print(f"    {len(dual_trades)} trades | PnL: ${results['mean_reversion_dual_v2'].total_pnl:.2f}")
+
+    # Strategy 3: Candle3 v2.1 (volume confirmation + min hold — unchanged from v2.0)
+    print("\n  Running Candle3 v2.1 (3m) [escalating volume + 1.5x avg + 3-bar min hold]...")
     candle3 = Candle3V2(equity=equity)
     candle3_trades = candle3.run(candles_3m)
     results["candle3_v2"] = engine.compute_stats(
-        candle3_trades, "Candle3 v2 (3m)", "BTCUSDT", "3m",
+        candle3_trades, "Candle3 v2.1 (3m)", "BTCUSDT", "3m",
         f"{candles_3m[0]['datetime'][:10]} to {candles_3m[-1]['datetime'][:10]}"
     )
     print(f"    {len(candle3_trades)} trades | PnL: ${results['candle3_v2'].total_pnl:.2f}")
@@ -89,9 +116,9 @@ def run_bot1_v2(candles_1h, candles_5m, candles_3m, equity: float) -> dict:
     return results
 
 
-def run_bot1_v1(candles_1h, candles_5m, candles_3m, equity: float) -> dict:
+def run_bot1_v1(candles_1h, candles_5m, candles_15m, candles_3m, equity: float) -> dict:
     """Run baseline Bot1 v1 strategies (for comparison)."""
-    print("\\n  [BASELINE v1 comparison]")
+    print("\n  [BASELINE v1 comparison]")
     engine = BacktestEngine(starting_equity=equity)
     results = {}
 
@@ -111,32 +138,32 @@ def run_bot1_v1(candles_1h, candles_5m, candles_3m, equity: float) -> dict:
 
 
 def run_bot2_v2(candles_1m, equity: float) -> dict:
-    """Run Bot2 v2 volume generation strategy."""
-    print("\\n" + "="*60)
-    print("BOT 2: VOLUME GENERATION BOT v2 (Spread 0.12%, Stop 0.01%, ATR Pause)")
+    """Run Bot2 v2.1 volume generation strategy."""
+    print("\n" + "="*60)
+    print("BOT 2: VOLUME GENERATION BOT v2.1 (20x, 0.70 util, ATR 0.15%, timeout 15)")
     print("="*60)
 
     engine = BacktestEngine(starting_equity=equity, maker_fee=0.0002, taker_fee=0.00055)
 
-    print("\\n  Running Ping-Pong Volume Gen v2 (1m)...")
+    print("\n  Running Ping-Pong Volume Gen v2.1 (1m)...")
     volgen = VolumeGenV2(equity=equity)
     volgen_trades = volgen.run(candles_1m)
     result = engine.compute_stats(
-        volgen_trades, "Ping-Pong Volume Gen v2 (1m)", "BTCUSDT", "1m",
+        volgen_trades, "Ping-Pong Volume Gen v2.1 (1m)", "BTCUSDT", "1m",
         f"{candles_1m[0]['datetime'][:10]} to {candles_1m[-1]['datetime'][:10]}"
     )
-    print(f"    {len(volgen_trades)} trades | PnL: ${result.total_pnl:.2f}")
+    print(f"    {len(volgen_trades)} trades | PnL: ${result.total_pnl:.2f} | Volume: ${result.total_volume:,.0f}")
 
-    print("\\n  [BASELINE v1 comparison]")
+    print("\n  [BASELINE v1 comparison]")
     volgen_v1 = VolumeGenV1(equity=equity)
     result_v1 = engine.compute_stats(
         volgen_v1.run(candles_1m), "Ping-Pong Volume Gen v1 (1m)", "BTCUSDT", "1m", "")
-    print(f"    v1: {result_v1.total_trades} trades | PnL: ${result_v1.total_pnl:.2f}")
+    print(f"    v1: {result_v1.total_trades} trades | PnL: ${result_v1.total_pnl:.2f} | Volume: ${result_v1.total_volume:,.0f}")
 
     return {"volume_gen_v2": result, "volume_gen_v1": result_v1}
 
 
-def format_result(r: BacktestResult, tag: str = "") -> str:
+def format_result(r: "BacktestResult", tag: str = "") -> str:
     label = f"  [{tag}] {r.strategy_name}" if tag else f"  {r.strategy_name}"
     lines = [
         label,
@@ -145,63 +172,69 @@ def format_result(r: BacktestResult, tag: str = "") -> str:
         f"    Profit Factor: {r.profit_factor:.2f} | Max DD: {r.max_drawdown_pct:.1f}% | Sharpe: {r.sharpe_ratio:.2f}",
         f"    Volume: ${r.total_volume:,.0f}",
     ]
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def generate_report(bot1_v1, bot1_v2, bot2_results, symbol, days, equity) -> str:
     report = []
     report.append("=" * 70)
-    report.append("PANTHER BACKTEST REPORT — v2 STRATEGY IMPROVEMENTS")
+    report.append("PANTHER BACKTEST REPORT — v2.1 (VOLUME TARGET + BUG FIXES)")
     report.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     report.append(f"Symbol: {symbol} | Days: {days} | Starting Equity: ${equity:,.2f}")
     report.append("=" * 70)
 
-    # Bot 2 (VolumeGen) — Priority 1 fix
-    report.append("\\n" + "-"*70)
-    report.append("PRIORITY 1: VOLUMEGEN PING-PONG (spread 0.05%->0.12%, stop 0.10%->0.01%, ATR pause)")
+    # Bot 2
+    report.append("\n" + "-"*70)
+    report.append("BOT 2: VOLUMEGEN PING-PONG (v2.1 volume math fixes)")
+    report.append("  Changes: leverage 15→20, util 0.60→0.70, ATR threshold 0.08%→0.15%,")
+    report.append("           position_timeout 6→15 bars, entry_timeout 3→5 bars,")
+    report.append("           max_daily_loss 3%→5%, max_consec_losses 5→7, stop 0.01%→0.008%")
     report.append("-"*70)
     report.append(format_result(bot2_results["volume_gen_v1"], "BEFORE"))
     report.append(format_result(bot2_results["volume_gen_v2"], "AFTER "))
     v1_pnl = bot2_results["volume_gen_v1"].total_pnl
     v2_pnl = bot2_results["volume_gen_v2"].total_pnl
     delta = v2_pnl - v1_pnl
-    report.append(f"\\n  >>> PnL Delta: ${delta:+.2f} ({'IMPROVEMENT' if delta > 0 else 'REGRESSION'})")
+    vol_delta = bot2_results["volume_gen_v2"].total_volume - bot2_results["volume_gen_v1"].total_volume
+    report.append(f"\n  >>> PnL Delta: ${delta:+.2f} ({'IMPROVEMENT' if delta > 0 else 'REGRESSION'})")
+    report.append(f"  >>> Volume Delta: ${vol_delta:+,.0f} ({'UP' if vol_delta > 0 else 'DOWN'})")
 
-    # Candle3 — Priority 1b fix on Bot1
-    report.append("\\n" + "-"*70)
-    report.append("PRIORITY 1b: CANDLE3 (escalating volume + 1.5x avg + 3-bar min hold)")
+    # Candle3
+    report.append("\n" + "-"*70)
+    report.append("BOT 1: CANDLE3 (v2.0 escalating volume + 3-bar min hold — unchanged in v2.1)")
     report.append("-"*70)
     report.append(format_result(bot1_v1["candle3_v1"], "BEFORE"))
     report.append(format_result(bot1_v2["candle3_v2"], "AFTER "))
     delta_c3 = bot1_v2["candle3_v2"].total_pnl - bot1_v1["candle3_v1"].total_pnl
-    report.append(f"\\n  >>> PnL Delta: ${delta_c3:+.2f} ({'IMPROVEMENT' if delta_c3 > 0 else 'REGRESSION'})")
+    report.append(f"\n  >>> PnL Delta: ${delta_c3:+.2f} ({'IMPROVEMENT' if delta_c3 > 0 else 'REGRESSION'})")
 
-    # Mean Reversion — Priority 2
-    report.append("\\n" + "-"*70)
-    report.append("PRIORITY 2: MEAN REVERSION (15m + 5m dual timeframe, reward 3x, band-close confirm)")
+    # Mean Reversion
+    report.append("\n" + "-"*70)
+    report.append("BOT 1: MEAN REVERSION (v2.1 cooldown fix + correct 15m candles + dual wired up)")
     report.append("-"*70)
-    report.append(format_result(bot1_v1["mean_reversion_v1"], "BEFORE (5m)"))
+    report.append(format_result(bot1_v1["mean_reversion_v1"], "BEFORE (5m only)"))
     report.append(format_result(bot1_v2["mean_reversion_15m_v2"], "AFTER 15m"))
     report.append(format_result(bot1_v2["mean_reversion_5m_v2"], "AFTER  5m"))
+    report.append(format_result(bot1_v2["mean_reversion_dual_v2"], "DUAL  combo"))
     pnl_before = bot1_v1["mean_reversion_v1"].total_pnl
     pnl_after = bot1_v2["mean_reversion_15m_v2"].total_pnl + bot1_v2["mean_reversion_5m_v2"].total_pnl
     delta_mr = pnl_after - pnl_before
-    report.append(f"\\n  >>> Combined PnL Delta: ${delta_mr:+.2f} ({'IMPROVEMENT' if delta_mr > 0 else 'REGRESSION'})")
+    report.append(f"\n  >>> Combined 15m+5m PnL Delta: ${delta_mr:+.2f} ({'IMPROVEMENT' if delta_mr > 0 else 'REGRESSION'})")
     trades_before = bot1_v1["mean_reversion_v1"].total_trades
     trades_after = bot1_v2["mean_reversion_15m_v2"].total_trades + bot1_v2["mean_reversion_5m_v2"].total_trades
     report.append(f"  >>> Trade Count: {trades_before} -> {trades_after} ({trades_after - trades_before:+d})")
 
-    # Trend Breakout — Priority 3
-    report.append("\\n" + "-"*70)
-    report.append("PRIORITY 3: TREND BREAKOUT (10-bar lookback + 24h fallback mode)")
+    # Trend Breakout
+    report.append("\n" + "-"*70)
+    report.append("BOT 1: TREND BREAKOUT (v2.1 bars_since_signal reset fix)")
     report.append("-"*70)
     report.append(format_result(bot1_v1["trend_breakout_v1"], "BEFORE"))
     report.append(format_result(bot1_v2["trend_breakout_v2"], "AFTER "))
     delta_tb = bot1_v2["trend_breakout_v2"].total_pnl - bot1_v1["trend_breakout_v1"].total_pnl
-    report.append(f"\\n  >>> PnL Delta: ${delta_tb:+.2f} ({'IMPROVEMENT' if delta_tb > 0 else 'REGRESSION'})")
+    report.append(f"\n  >>> PnL Delta: ${delta_tb:+.2f} ({'IMPROVEMENT' if delta_tb > 0 else 'REGRESSION'})")
 
     # Summary
-    report.append("\\n" + "="*70)
+    report.append("\n" + "="*70)
     report.append("OVERALL SUMMARY")
     report.append("="*70)
 
@@ -216,26 +249,35 @@ def generate_report(bot1_v1, bot1_v2, bot2_results, symbol, days, equity) -> str
                 bot1_v2["candle3_v2"].total_pnl +
                 bot2_results["volume_gen_v2"].total_pnl)
 
-    report.append(f"  v1 Combined PnL:  ${v1_total:+.2f}")
-    report.append(f"  v2 Combined PnL:  ${v2_total:+.2f}")
-    report.append(f"  Net Improvement:  ${v2_total - v1_total:+.2f}")
-    report.append(f"  Return on ${equity:.0f}: {v2_total/equity*100:+.2f}%")
+    v1_vol = (bot2_results["volume_gen_v1"].total_volume)
+    v2_vol = (bot2_results["volume_gen_v2"].total_volume +
+              bot1_v2["mean_reversion_15m_v2"].total_volume +
+              bot1_v2["mean_reversion_5m_v2"].total_volume +
+              bot1_v2["candle3_v2"].total_volume +
+              bot1_v2["trend_breakout_v2"].total_volume)
 
-    report.append("\\n" + "="*70)
+    report.append(f"  v1 Combined PnL:    ${v1_total:+.2f}")
+    report.append(f"  v2.1 Combined PnL:  ${v2_total:+.2f}")
+    report.append(f"  Net Improvement:    ${v2_total - v1_total:+.2f}")
+    report.append(f"  Return on ${equity:.0f}:  {v2_total/equity*100:+.2f}%")
+    report.append(f"\n  v2.1 Combined Volume: ${v2_vol:,.0f}")
+    report.append(f"  Daily Volume Rate:    ${v2_vol/days:,.0f}/day (over {days} days)")
+
+    report.append("\n" + "="*70)
     report.append("NEXT STEPS")
     report.append("="*70)
-    report.append("  1. If VolumeGen v2 PnL positive -> deploy with $50-100 real capital, Bybit testnet first")
-    report.append("  2. If Candle3 v2 win rate > 60% -> integrate volume filter into live bot2_strategy.py")
-    report.append("  3. MeanReversion dual mode: run 30-day test to confirm trade count doubles")
-    report.append("  4. Consider ATR pause threshold tuning: test 0.05%, 0.08%, 0.12% cutoffs")
-    report.append("  5. Run: python run_backtest_v2.py --days 30 for full-sample validation")
-    report.append("\\n" + "="*70)
+    report.append("  1. If Bot2 v2.1 daily volume > $300k and PnL positive -> deploy on Bybit testnet")
+    report.append("  2. ATR threshold tuning: test 0.10%, 0.15%, 0.20% to find optimal vol/safety balance")
+    report.append("  3. Dual MeanReversion: check if dual_trades > 15m+5m individual (confirms confluence sizing active)")
+    report.append("  4. If Candle3 win rate < 55%, loosen vol_multiplier: 1.5 → 1.2")
+    report.append("  5. Run: python run_backtest_v2.py --days 90 for full-sample validation")
+    report.append("\n" + "="*70)
 
-    return "\\n".join(report)
+    return "\n".join(report)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Panther Backtest v2 — Strategy Improvement Comparison")
+    parser = argparse.ArgumentParser(description="Panther Backtest v2.1 — Volume Target + Bug Fixes")
     parser.add_argument("--days", type=int, default=30, help="Days of historical data (default: 30)")
     parser.add_argument("--symbol", type=str, default="BTCUSDT")
     parser.add_argument("--equity", type=float, default=500.0)
@@ -251,37 +293,41 @@ def main():
     days = args.days
     equity = args.equity
 
-    print(f"\\n{'='*60}")
-    print(f"PANTHER BACKTEST v2 FRAMEWORK")
+    print(f"\n{'='*60}")
+    print(f"PANTHER BACKTEST v2.1 FRAMEWORK")
     print(f"Symbol: {symbol} | Days: {days} | Equity: ${equity:,.2f}")
     print(f"{'='*60}")
 
-    # Fetch / load data
+    # v2.1 FIX: Added '15m' interval — was missing from v2.0 runner.
+    # MeanReversionBacktest 15m was running on 5m candles as a "proxy".
     intervals = {
         "1m": f"{data_dir}/{symbol.lower()}_1m.json",
         "3m": f"{data_dir}/{symbol.lower()}_3m.json",
         "5m": f"{data_dir}/{symbol.lower()}_5m.json",
+        "15m": f"{data_dir}/{symbol.lower()}_15m.json",  # v2.1: added
         "1h": f"{data_dir}/{symbol.lower()}_1h.json",
     }
 
     candle_data = {}
     for interval, filepath in intervals.items():
         if args.no_download and os.path.exists(filepath):
-            print(f"\\nLoading cached {interval} data...")
+            print(f"\nLoading cached {interval} data...")
             candle_data[interval] = load_candles(filepath)
         else:
-            print(f"\\nFetching {interval} data from Bybit...")
+            print(f"\nFetching {interval} data from Bybit ({days} days)...")
             candles = fetch_full_history(symbol, interval, days=days)
             save_candles(candles, filepath)
             candle_data[interval] = candles
 
     for interval, candles in candle_data.items():
+        print(f"  {interval}: {len(candles)} candles")
         if len(candles) < 50:
-            print(f"\\n[WARNING] Only {len(candles)} {interval} candles.")
+            print(f"  [WARNING] Only {len(candles)} {interval} candles. Results may be unreliable.")
 
     # Run backtests
-    bot1_v1 = run_bot1_v1(candle_data["1h"], candle_data["5m"], candle_data["3m"], equity)
-    bot1_v2 = run_bot1_v2(candle_data["1h"], candle_data["5m"], candle_data["3m"], equity)
+    # v2.1 FIX: pass candles_15m as separate arg — v2.0 runner didn't have it
+    bot1_v1 = run_bot1_v1(candle_data["1h"], candle_data["5m"], candle_data["15m"], candle_data["3m"], equity)
+    bot1_v2 = run_bot1_v2(candle_data["1h"], candle_data["5m"], candle_data["15m"], candle_data["3m"], equity)
     bot2_results = run_bot2_v2(candle_data["1m"], equity)
 
     report = generate_report(bot1_v1, bot1_v2, bot2_results, symbol, days, equity)
@@ -290,8 +336,8 @@ def main():
     with open(report_path, "w") as f:
         f.write(report)
 
-    print(f"\\n\\nReport saved: {report_path}")
-    print("\\n" + report)
+    print(f"\n\nReport saved: {report_path}")
+    print("\n" + report)
 
     # Save all trade logs
     all_results = {**bot1_v1, **bot1_v2, **bot2_results}
@@ -317,9 +363,9 @@ def main():
     trade_log_path = os.path.join(args.output, "trade_log_v2.json")
     with open(trade_log_path, "w") as f:
         json.dump(all_trades, f, indent=2)
-    print(f"\\nTrade log saved: {trade_log_path} ({len(all_trades)} trades)")
+    print(f"\nTrade log saved: {trade_log_path} ({len(all_trades)} trades)")
 
-    print(f"\\n{'='*60}")
+    print(f"\n{'='*60}")
     print(f"DONE! All results in ./{args.output}/")
     print(f"{'='*60}")
 
